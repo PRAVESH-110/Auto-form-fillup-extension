@@ -5,7 +5,8 @@ function App() {
   const [profiles, setProfiles] = useState([]);
   const [isEditing, setIsEditing] = useState(false);
   const [editingIndex, setEditingIndex] = useState(null);
-  const [selected, setSelected] = useState(null);
+  const [selected, setSelected] = useState("");
+  const [fillStatus, setFillStatus] = useState("");
 
   const initialFormState = {
     firstName: "",
@@ -106,84 +107,117 @@ function App() {
   };
 
   const fillForm = () => {
-    if (selected == null) return;
+    if (selected === "") {
+      setFillStatus("Choose a profile first.");
+      return;
+    }
 
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (!tabs[0]?.id) {
+        setFillStatus("Open a job application page in a normal Chrome tab first.");
+        return;
+      }
+
       chrome.scripting.executeScript({
         target: { tabId: tabs[0].id },
         func: (profile) => {
-          // Comprehensive list of keywords for better matching
-          const FIELD_KEYWORDS = {
-            firstName: ["first name", "firstname", "fname", "given name"],
-            lastName: ["last name", "lastname", "lname", "surname", "family name"],
-            fullName: ["full name", "fullname", "name", "your name"],
-            email: ["email", "e-mail", "mail address", "email address"],
-            phone: ["phone", "mobile", "cell", "contact", "telephone", "phone number", "mobile number"],
-            address: ["address", "street", "mailing address", "residence"],
-            city: ["city", "town", "district"],
-            state: ["state", "province", "region"],
-            pincode: ["pincode", "zip", "postal", "zipcode"],
-            country: ["country", "nation"],
-            dob: ["dob", "birth", "date of birth", "birthday"],
-            gender: ["gender", "sex"],
-            linkedin: ["linkedin", "linked-in", "linkedin profile", "linkedin url"],
-            github: ["github", "git-hub", "github profile", "github url"],
-            portfolio: ["portfolio", "website", "personal site", "webpage", "blog"],
-            university: ["university", "college", "school", "institution", "institute", "alma mater"],
-            degree: ["degree", "qualification", "course", "education level"],
-            major: ["major", "department", "branch", "specialization", "field of study"],
-            gradYear: ["graduation year", "passing year", "year of passing", "class of", "completion year"],
-            gpa: ["gpa", "cgpa", "grade", "score", "percentage"],
-            currentCompany: ["current company", "employer", "organization", "workplace", "company name"],
-            currentRole: ["job title", "designation", "role", "position", "current position"],
-            skills: ["skills", "technologies", "competencies", "key skills", "tech stack"]
+          const keywords = {
+            firstName: ["first name", "firstname", "given name", "givenname", "forename", "fname"],
+            lastName: ["last name", "lastname", "family name", "familyname", "surname", "lname"],
+            fullName: ["full name", "fullname", "your name", "candidate name", "applicant name", "name"],
+            email: ["email address", "e-mail", "email"],
+            phone: ["phone number", "mobile number", "telephone", "mobile", "phone"],
+            address: ["street address", "streetaddress", "mailing address", "address line", "addressline", "address"],
+            city: ["city", "town"], state: ["state", "province"],
+            pincode: ["postal code", "postcode", "zip code", "pincode", "zip"],
+            country: ["country"], dob: ["date of birth", "birth date", "birthday", "dob"],
+            gender: ["gender", "sex"], linkedin: ["linkedin"], github: ["github"],
+            portfolio: ["portfolio", "personal website", "website"],
+            university: ["university", "college", "institution", "school"],
+            degree: ["degree", "qualification", "education level"],
+            major: ["field of study", "specialization", "major", "department"],
+            gradYear: ["graduation year", "year of graduation", "year of passing", "passing year"],
+            gpa: ["gpa", "cgpa", "percentage"],
+            currentCompany: ["current company", "company name", "employer", "organization"],
+            currentRole: ["job title", "current role", "designation", "current position"],
+            skills: ["key skills", "technical skills", "skills", "technologies"]
           };
+          const normalize = (text) => (text || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+          const fields = Object.entries(keywords).flatMap(([key, terms]) =>
+            terms.map((term) => ({ key, term: normalize(term) }))
+          ).sort((a, b) => b.term.length - a.term.length);
+          const controls = document.querySelectorAll("input, select, textarea");
+          const handledRadioGroups = new Set();
+          let filled = 0;
+          let skipped = 0;
 
-          const inputs = document.querySelectorAll("input, select, textarea");
+          for (const control of controls) {
+            try {
+              const type = (control.type || "").toLowerCase();
+              if (control.disabled || control.readOnly || ["hidden", "password", "submit", "button", "reset", "file", "image"].includes(type)) continue;
+              if (type === "checkbox") continue;
+              const currentValue = normalize(control.value);
+              const isPlaceholder = control instanceof HTMLSelectElement && (!currentValue || /^(select|choose|please select|select one)$/.test(currentValue));
+              if (type !== "radio" && String(control.value || "").trim() && !isPlaceholder) { skipped++; continue; }
 
-          inputs.forEach((input) => {
-            // Include parent text, label text (if explicit), placeholder, name, id
-            // Often labels are not direct parents, but checking direct parent help. 
-            // Better heuristic: Check for associated label tag, but simple parent/placeholder check works for many.
+              const labelledBy = (control.getAttribute("aria-labelledby") || "").split(/\s+/)
+                .map((id) => document.getElementById(id)?.innerText || "").join(" ");
+              const wrappingLabel = control.closest("label")?.innerText || "";
+              const explicitLabels = Array.from(control.labels || []).map((label) => label.innerText || "").join(" ");
+              const legend = control.closest("fieldset")?.querySelector("legend")?.innerText || "";
+              const clues = normalize([
+                control.name, control.id, control.placeholder, control.getAttribute("aria-label"),
+                control.autocomplete, labelledBy, wrappingLabel, explicitLabels, legend
+              ].join(" "));
+              const match = fields.find(({ term }) => (` ${clues} `).includes(` ${term} `));
+              if (!match || !profile[match.key]) { skipped++; continue; }
 
-            let labelText = "";
-            if (input.id) {
-              const label = document.querySelector(`label[for='${input.id}']`);
-              if (label) labelText = label.innerText;
-            }
-
-            const raw = `${input.name} ${input.id} ${input.placeholder || ""} ${input.getAttribute("aria-label") || ""} ${labelText} ${input.parentElement?.innerText || ""}`.toLowerCase();
-
-            const getFieldMatch = () => {
-              for (const [key, keywords] of Object.entries(FIELD_KEYWORDS)) {
-                if (keywords.some((k) => raw.includes(k))) {
-                  // Special logic: "First Name" vs "Full Name"
-                  // If raw has "first name", matchedKey will be "firstName" (if iterate order matches)
-                  // If FIELD_KEYWORDS order is indeterminate, it might be tricky.
-                  // But usually "first name" is more specific than "name".
-                  // However, logic below iterates keys. 
-
-                  // Refinement: strict check for "name" to avoid matching "username" or "filename" if needed, 
-                  // but "name" is in keywords.
-
-                  // Conflict resolution:
-                  if (key === "fullName" && (raw.includes("first") || raw.includes("last") || raw.includes("sur"))) return null;
-                  return key;
-                }
+              const value = String(profile[match.key]);
+              if (type === "radio") {
+                if (!control.name || handledRadioGroups.has(control.name)) continue;
+                handledRadioGroups.add(control.name);
+                const radioGroup = Array.from(document.querySelectorAll("input[type=radio]")).filter((item) => item.name === control.name);
+                const option = radioGroup.find((item) => {
+                  const optionText = normalize(`${item.value} ${item.labels ? Array.from(item.labels).map((l) => l.innerText).join(" ") : ""}`);
+                  return optionText === normalize(value) || (` ${optionText} `).includes(` ${normalize(value)} `);
+                });
+                if (!option) { skipped++; continue; }
+                option.checked = true;
+                option.dispatchEvent(new Event("change", { bubbles: true }));
+                filled++;
+                continue;
               }
-              return null;
-            };
 
-            const matchedKey = getFieldMatch();
+              if (control instanceof HTMLSelectElement) {
+                const option = Array.from(control.options).find((item) => normalize(item.value) === normalize(value) || normalize(item.text) === normalize(value));
+                if (!option) { skipped++; continue; }
+                control.value = option.value;
+                control.dispatchEvent(new Event("change", { bubbles: true }));
+                filled++;
+                continue;
+              }
 
-            if (matchedKey && profile[matchedKey]) {
-              input.value = profile[matchedKey];
-              input.dispatchEvent(new Event('input', { bubbles: true }));
-              input.dispatchEvent(new Event('change', { bubbles: true }));
+              if (control instanceof HTMLInputElement && ["email", "tel", "url", "date", "number"].includes(type)) {
+                if (type === "date" && !/^\d{4}-\d{2}-\d{2}$/.test(value)) { skipped++; continue; }
+                if (type === "number" && Number.isNaN(Number(value))) { skipped++; continue; }
+              }
+              const proto = control instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+              Object.getOwnPropertyDescriptor(proto, "value").set.call(control, value);
+              control.dispatchEvent(new Event("input", { bubbles: true }));
+              control.dispatchEvent(new Event("change", { bubbles: true }));
+              filled++;
+            } catch {
+              skipped++;
             }
-          });
+          }
+          return { filled, skipped };
         },
-        args: [profiles[selected]],
+        args: [profiles[Number(selected)]],
+      }).then((results) => {
+        const summary = results?.[0]?.result;
+        setFillStatus(summary ? `Filled ${summary.filled} fields${summary.skipped ? `; skipped ${summary.skipped}.` : "."}` : "No form fields found on this page.");
+      }).catch(() => {
+        setFillStatus("Chrome could not access this page. Try a regular job application tab, then click Fill again.");
       });
     });
   };
@@ -205,8 +239,9 @@ function App() {
               </option>
             ))}
           </select>
-          <button onClick={fillForm} disabled={selected === null} className="primary-btn">Fill</button>
+          <button onClick={fillForm} disabled={selected === ""} className="primary-btn">Fill</button>
         </div>
+        {fillStatus && <p role="status" className="empty-msg">{fillStatus}</p>}
       </div>
 
       <div className="card">
@@ -231,6 +266,8 @@ function App() {
           <input placeholder="State" value={form.state} onChange={(e) => setForm({ ...form, state: e.target.value })} />
           <input placeholder="Country" value={form.country} onChange={(e) => setForm({ ...form, country: e.target.value })} />
         </div>
+        <input className="full-width" placeholder="Address" value={form.address} onChange={(e) => setForm({ ...form, address: e.target.value })} />
+        <input className="full-width" placeholder="Postal / PIN Code" value={form.pincode} onChange={(e) => setForm({ ...form, pincode: e.target.value })} />
 
         <h5 className="sub-title">Social Links</h5>
         <input className="full-width" placeholder="LinkedIn URL" value={form.linkedin} onChange={(e) => setForm({ ...form, linkedin: e.target.value })} />
